@@ -1,4 +1,4 @@
-"""Playback orchestration for randomized local video segments."""
+"""Playback controller for random video segments."""
 
 from __future__ import annotations
 
@@ -6,26 +6,19 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import random
-from typing import Sequence
+from typing import Callable
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QTimer, QUrl, QObject, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
+
 
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class SegmentPlan:
-    """Chosen segment boundaries in milliseconds."""
-
-    start_ms: int
-    duration_ms: int
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class SegmentInfo:
-    """Runtime payload emitted to UI for status updates."""
+    """Runtime details for a currently scheduled/playing segment."""
 
     file_path: Path
     start_ms: int
@@ -34,211 +27,144 @@ class SegmentInfo:
     playlist_total: int
 
 
-class SessionQueue:
-    """Shuffled queue that reshuffles on each full pass when loop is enabled."""
-
-    def __init__(self) -> None:
-        self._loop = True
-        self._source: list[Path] = []
-        self._queue: list[Path] = []
-        self._index = 0
-
-    def configure(self, paths: Sequence[Path], loop: bool = True) -> None:
-        self._loop = loop
-        self._source = list(paths)
-        self._queue = list(self._source)
-        random.shuffle(self._queue)
-        self._index = 0
-
-    @property
-    def total(self) -> int:
-        return len(self._queue)
-
-    @property
-    def index(self) -> int:
-        return self._index
-
-    def next_path(self) -> Path | None:
-        if not self._queue:
-            return None
-        if self._index >= len(self._queue):
-            if not self._loop:
-                return None
-            random.shuffle(self._queue)
-            self._index = 0
-
-        path = self._queue[self._index]
-        self._index += 1
-        return path
-
-
-def choose_segment(duration_ms: int, min_seconds: int, max_seconds: int) -> SegmentPlan:
-    """Choose random segment boundaries that fit inside media duration."""
-    if duration_ms <= 0:
-        raise ValueError("Media duration must be positive")
-
-    min_seconds = max(1, min_seconds)
-    max_seconds = max(min_seconds, max_seconds)
-
-    min_ms = min_seconds * 1000
-    max_ms = max_seconds * 1000
-
-    if duration_ms <= min_ms:
-        return SegmentPlan(start_ms=0, duration_ms=duration_ms)
-
-    duration_choice = random.randint(min_ms, max_ms)
-    duration_choice = min(duration_choice, duration_ms)
-
-    max_start = max(0, duration_ms - duration_choice)
-    start_ms = random.randint(0, max_start) if max_start else 0
-    return SegmentPlan(start_ms=start_ms, duration_ms=duration_choice)
-
-
 class SegmentPlayer(QObject):
-    """Qt media player wrapper implementing random segmented playback."""
+    """Controls media playback and segment scheduling over a shuffled playlist."""
 
-    segment_started = Signal(object)  # SegmentInfo
+    segment_changed = Signal(object)  # SegmentInfo
     playback_error = Signal(str)
     queue_empty = Signal()
 
-    def __init__(self, video_widget: QVideoWidget) -> None:
+    def __init__(self, video_widget: QVideoWidget, on_next_requested: Callable[[], None]) -> None:
         super().__init__()
-        self._player = QMediaPlayer(self)
-        self._audio = QAudioOutput(self)
-        self._player.setAudioOutput(self._audio)
-        self._player.setVideoOutput(video_widget)
+        self.media_player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.setVideoOutput(video_widget)
 
-        self._segment_timer = QTimer(self)
-        self._segment_timer.setSingleShot(True)
-        self._segment_timer.timeout.connect(self.next_segment)
+        self._segment_end_timer = QTimer(self)
+        self._segment_end_timer.setSingleShot(True)
+        self._segment_end_timer.timeout.connect(on_next_requested)
 
-        self._session = SessionQueue()
-        self._active = False
-        self._paused_remaining_ms: int | None = None
+        self._playlist: list[Path] = []
+        self._index = -1
+        self._loop = True
+        self._playing = False
 
-        self._min_seconds = 60
-        self._max_seconds = 120
+        self._pending_start_ms: int | None = None
 
-        self._pending_file: Path | None = None
-        self._pending_duration_retries = 0
+        self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self.media_player.errorOccurred.connect(self._on_error)
 
-        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
-        self._player.errorOccurred.connect(self._on_error)
+    def set_volume(self, value: int) -> None:
+        self.audio_output.setVolume(max(0.0, min(1.0, value / 100.0)))
 
-    def configure_session(self, playlist: Sequence[Path], min_seconds: int, max_seconds: int, loop: bool) -> None:
-        """Initialize a new session with a newly shuffled queue."""
-        self.stop()
-        self._session.configure(playlist, loop=loop)
-        self._min_seconds = min_seconds
-        self._max_seconds = max_seconds
+    def set_muted(self, is_muted: bool) -> None:
+        self.audio_output.setMuted(is_muted)
 
-    def start(self) -> None:
-        """Start playback from next queue item."""
-        if self._session.total == 0:
-            self.queue_empty.emit()
-            return
-        self._active = True
-        self.next_segment()
-
-    @Slot()
-    def next_segment(self) -> None:
-        """Advance to next random source segment."""
-        if not self._active:
-            return
-
-        self._segment_timer.stop()
-        self._paused_remaining_ms = None
-
-        next_path = self._session.next_path()
-        if next_path is None:
-            self._active = False
-            self.queue_empty.emit()
-            return
-
-        self._pending_file = next_path
-        self._pending_duration_retries = 0
-
-        self._player.stop()
-        self._player.setSource(QUrl.fromLocalFile(str(next_path)))
-
-    def stop(self) -> None:
-        """Stop playback and clear active session state."""
-        self._active = False
-        self._pending_file = None
-        self._segment_timer.stop()
-        self._paused_remaining_ms = None
-        self._player.stop()
-
-    def pause(self) -> None:
-        """Pause current segment playback."""
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
-            if self._segment_timer.isActive():
-                self._paused_remaining_ms = self._segment_timer.remainingTime()
-                self._segment_timer.stop()
-
-    def resume(self) -> None:
-        """Resume playback and segment timer."""
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-            self._player.play()
-            if self._paused_remaining_ms and self._paused_remaining_ms > 0:
-                self._segment_timer.start(self._paused_remaining_ms)
-
-    def set_volume(self, level: int) -> None:
-        self._audio.setVolume(max(0.0, min(1.0, level / 100.0)))
-
-    def set_muted(self, muted: bool) -> None:
-        self._audio.setMuted(muted)
+    def configure_playlist(self, playlist: list[Path], loop: bool = True) -> None:
+        self._playlist = list(playlist)
+        self._index = -1
+        self._loop = loop
+        self._playing = False
+        self._segment_end_timer.stop()
 
     def is_active(self) -> bool:
-        return self._active
+        return self._playing
+
+    def pause(self) -> None:
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+            if self._segment_end_timer.isActive():
+                self._remaining_ms = self._segment_end_timer.remainingTime()
+                self._segment_end_timer.stop()
+
+    def resume(self) -> None:
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+            self.media_player.play()
+            remaining = getattr(self, "_remaining_ms", None)
+            if remaining is not None and remaining > 0:
+                self._segment_end_timer.start(remaining)
+
+    def stop(self) -> None:
+        self._playing = False
+        self._segment_end_timer.stop()
+        self.media_player.stop()
+
+    def play_next_segment(self, min_seconds: int, max_seconds: int) -> None:
+        if not self._playlist:
+            self.queue_empty.emit()
+            return
+
+        self._playing = True
+        self._index += 1
+        if self._index >= len(self._playlist):
+            if not self._loop:
+                self.stop()
+                self.queue_empty.emit()
+                return
+            random.shuffle(self._playlist)
+            self._index = 0
+
+        file_path = self._playlist[self._index]
+        self._schedule_segment(file_path, min_seconds, max_seconds)
+
+    def _schedule_segment(self, file_path: Path, min_seconds: int, max_seconds: int) -> None:
+        min_seconds = max(1, min_seconds)
+        max_seconds = max(min_seconds, max_seconds)
+
+        # Duration is unknown until media is loaded; store plan and finish in callback.
+        self._pending_file = file_path
+        self._pending_min_seconds = min_seconds
+        self._pending_max_seconds = max_seconds
+        self._pending_start_ms = None
+
+        self.media_player.stop()
+        self.media_player.setSource(QUrl.fromLocalFile(str(file_path)))
 
     @Slot("QMediaPlayer::MediaStatus")
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if self._pending_file is None:
+        if status != QMediaPlayer.MediaStatus.LoadedMedia:
             return
 
-        if status not in {
-            QMediaPlayer.MediaStatus.LoadedMedia,
-            QMediaPlayer.MediaStatus.BufferedMedia,
-        }:
+        if not hasattr(self, "_pending_file"):
             return
 
-        duration_ms = self._player.duration()
-        if duration_ms <= 0 and self._pending_duration_retries < 10:
-            self._pending_duration_retries += 1
-            QTimer.singleShot(100, lambda: self._on_media_status_changed(status))
-            return
-
+        duration_ms = self.media_player.duration()
         if duration_ms <= 0:
-            self.playback_error.emit(f"Unable to determine duration for {self._pending_file.name}")
-            self._pending_file = None
-            self.next_segment()
+            self.playback_error.emit(f"Could not read duration: {self._pending_file}")
             return
 
-        plan = choose_segment(duration_ms, self._min_seconds, self._max_seconds)
-        current_file = self._pending_file
-        self._pending_file = None
+        min_ms = self._pending_min_seconds * 1000
+        max_ms = self._pending_max_seconds * 1000
 
-        self._player.setPosition(plan.start_ms)
-        self._player.play()
-        self._segment_timer.start(plan.duration_ms)
+        if duration_ms <= min_ms:
+            segment_ms = duration_ms
+            start_ms = 0
+        else:
+            segment_ms = random.randint(min_ms, max_ms)
+            segment_ms = min(segment_ms, duration_ms)
+            max_start = max(0, duration_ms - segment_ms)
+            start_ms = random.randint(0, max_start) if max_start > 0 else 0
 
-        self.segment_started.emit(
-            SegmentInfo(
-                file_path=current_file,
-                start_ms=plan.start_ms,
-                duration_ms=plan.duration_ms,
-                playlist_index=self._session.index,
-                playlist_total=self._session.total,
-            )
+        self._pending_start_ms = start_ms
+
+        info = SegmentInfo(
+            file_path=self._pending_file,
+            start_ms=start_ms,
+            duration_ms=segment_ms,
+            playlist_index=self._index + 1,
+            playlist_total=len(self._playlist),
         )
+        self.segment_changed.emit(info)
+
+        self.media_player.setPosition(start_ms)
+        self.media_player.play()
+        self._segment_end_timer.start(segment_ms)
+
+        del self._pending_file
 
     @Slot("QMediaPlayer::Error", str)
-    def _on_error(self, _error: QMediaPlayer.Error, message: str) -> None:
-        error_message = message or "Unknown playback error"
-        LOGGER.error("Playback error: %s", error_message)
-        self.playback_error.emit(error_message)
-        self._pending_file = None
-        if self._active:
-            self.next_segment()
+    def _on_error(self, _error: QMediaPlayer.Error, error_string: str) -> None:
+        message = error_string or "Unknown playback error"
+        LOGGER.error("Playback error: %s", message)
+        self.playback_error.emit(message)

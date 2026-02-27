@@ -1,4 +1,4 @@
-"""Video library discovery and in-memory management."""
+"""Library management and video discovery utilities."""
 
 from __future__ import annotations
 
@@ -8,76 +8,73 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+
 LOGGER = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = {".mp4"}
-IGNORED_NAMES = {
-    "$recycle.bin",
-    "system volume information",
-    "__macosx",
-}
 
-
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class VideoItem:
-    """Single discovered video entry."""
+    """Represents a discovered local video file."""
 
     path: Path
 
 
 class VideoLibrary:
-    """Session-scoped in-memory library of videos."""
+    """In-memory video library with recursive discovery support."""
 
     def __init__(self) -> None:
-        self._root: Path | None = None
         self._items: list[VideoItem] = []
+        self._root_folder: Path | None = None
 
     @property
     def root_folder(self) -> Path | None:
-        """Current root folder used for discovery."""
-        return self._root
+        """Currently selected root folder."""
+        return self._root_folder
 
     @property
     def items(self) -> list[VideoItem]:
-        """Return a copy of discovered items."""
+        """Copy of currently discovered videos."""
         return list(self._items)
 
-    def update(self, root_folder: Path, items: Iterable[VideoItem]) -> None:
-        """Replace current library contents."""
-        self._root = root_folder
-        self._items = sorted(list(items), key=lambda item: str(item.path).lower())
+    def set_items(self, root_folder: Path, items: Iterable[VideoItem]) -> None:
+        """Update the library after a scan completes."""
+        self._root_folder = root_folder
+        self._items = list(items)
 
     @staticmethod
     def scan_folder(root_folder: Path) -> list[VideoItem]:
-        """Recursively scan for supported video files.
+        """Recursively discover .mp4 files under root_folder.
 
-        Hidden files/folders and common system folders are skipped where practical.
+        Hidden/system-like folders and hidden files are skipped when practical.
         """
+        LOGGER.info("Scanning folder: %s", root_folder)
         if not root_folder.exists() or not root_folder.is_dir():
             raise ValueError(f"Invalid folder: {root_folder}")
 
         discovered: list[VideoItem] = []
-        LOGGER.info("Scanning for videos under: %s", root_folder)
 
         for current_root, dirs, files in os.walk(root_folder):
-            dirs[:] = [d for d in dirs if not is_hidden_or_ignored_name(d)]
+            dirs[:] = [d for d in dirs if not _is_hidden_or_system_name(d)]
 
-            current = Path(current_root)
+            current_path = Path(current_root)
             for filename in files:
-                if is_hidden_or_ignored_name(filename):
+                if _is_hidden_or_system_name(filename):
                     continue
-                candidate = current / filename
-                if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    discovered.append(VideoItem(path=candidate))
+                full_path = current_path / filename
+                if full_path.suffix.lower() == ".mp4":
+                    discovered.append(VideoItem(path=full_path))
 
-        LOGGER.info("Found %d video(s)", len(discovered))
+        LOGGER.info("Discovered %d mp4 files", len(discovered))
         return discovered
 
 
-def is_hidden_or_ignored_name(name: str) -> bool:
-    """Best-effort filename or directory-name filtering."""
-    if not name:
-        return True
+def _is_hidden_or_system_name(name: str) -> bool:
+    """Best-effort hidden/system detection based on path segment names."""
     if name.startswith("."):
         return True
-    return name.lower() in IGNORED_NAMES
+    return name.lower() in {
+        "$recycle.bin",
+        "system volume information",
+        "__macosx",
+        "node_modules",
+    }
